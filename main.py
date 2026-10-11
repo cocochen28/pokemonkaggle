@@ -1,6 +1,7 @@
 import os
 import random
 import re
+import sys
 
 from cg.api import all_card_data, all_attack
 
@@ -78,6 +79,12 @@ def set_deck(deck: list[int]) -> None:
 
 set_deck(read_deck_csv())
 
+# Every evolution in the card pool (used when the policy plays the opponent inside search rollouts).
+EVOLUTIONS_ALL = {}
+for _c in CARDS.values():
+    if _c.cardType == POKEMON and _c.evolvesFrom:
+        EVOLUTIONS_ALL.setdefault(_c.evolvesFrom, []).append(_c.cardId)
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -125,6 +132,7 @@ class Ctx:
         self.my = self.cur["players"][self.me]
         self.their = self.cur["players"][self.opp]
         self.hand = self.my["hand"] or []
+        self.evolutions = EVOLUTIONS if REAL_ME is None or self.me == REAL_ME else EVOLUTIONS_ALL
 
     # -- locating cards -----------------------------------------------------
     def card_at(self, area, index, player=None):
@@ -238,9 +246,9 @@ class Ctx:
 
     def potential_attacks(self, pk):
         """Attacks this Pokémon has or will have after evolving (evolutions found in my deck)."""
-        ids = [pk["id"]] + EVOLUTIONS.get(CARDS[pk["id"]].name, [])
+        ids = [pk["id"]] + self.evolutions.get(CARDS[pk["id"]].name, [])
         for e in list(ids[1:]):
-            ids += EVOLUTIONS.get(CARDS[e].name, [])
+            ids += self.evolutions.get(CARDS[e].name, [])
         out = []
         for cid in ids:
             for aid in CARDS[cid].attacks:
@@ -299,7 +307,7 @@ class Ctx:
         if c.cardType == POKEMON:
             if c.basic:
                 v = 90 if n_in_play <= 2 else 70 if n_in_play < 4 else 30
-                if c.name in EVOLUTIONS:
+                if c.name in self.evolutions:
                     v += 10
             elif c.evolvesFrom in in_play_names:
                 bases = sum(1 for p in self.in_play() if CARDS[p["id"]].name == c.evolvesFrom)
@@ -343,7 +351,10 @@ def score_main(ctx: Ctx, opt: dict) -> float:
         c = CARDS[ctx.card_at(opt["area"], opt["index"])["id"]]
         return 100 + (5 if c.megaEx or c.ex else 0)
     if t == O_PLAY:
-        return score_play(ctx, ctx.hand[opt["index"]]["id"])
+        cid = ctx.hand[opt["index"]]["id"]
+        if "turn ends" in skill_text(cid):
+            return score_turn_ender(ctx)
+        return score_play(ctx, cid)
     if t == O_ATTACH:
         card = ctx.card_at(opt["area"], opt["index"])
         target = ctx.card_at(opt["inPlayArea"], opt["inPlayIndex"])
@@ -355,6 +366,9 @@ def score_main(ctx: Ctx, opt: dict) -> float:
         etypes = [c.energyType] if c.cardType == BASIC_ENERGY else [COLORLESS]
         return score_energy_attach(ctx, target, opt["inPlayArea"] == ACTIVE, etypes)
     if t == O_ABILITY:
+        card = ctx.card_at(opt["area"], opt["index"])
+        if card and "turn ends" in skill_text(card["id"]):
+            return score_turn_ender(ctx)
         return 65
     if t == O_RETREAT:
         return score_retreat(ctx)
@@ -369,6 +383,17 @@ def score_main(ctx: Ctx, opt: dict) -> float:
     if t == O_DISCARD:
         return -5
     return 1
+
+
+def skill_text(cid: int) -> str:
+    c = CARDS.get(cid)
+    return " ".join(s.text for s in c.skills) if c else ""
+
+
+def score_turn_ender(ctx: Ctx) -> float:
+    """Effects that end the turn (Lumiose City, Boxed Order...): last thing to do, never instead of attacking."""
+    can_attack = any(o["type"] == O_ATTACK for o in ctx.sel["option"])
+    return -1 if can_attack else 5
 
 
 def score_energy_attach(ctx: Ctx, target: dict, is_active: bool, etypes: list[int]) -> float:
@@ -400,7 +425,8 @@ def score_play(ctx: Ctx, cid: int) -> float:
     if "Switch in 1 of your opponent" in text:
         return 66 if ctx.can_ko_benched() else -5
     if "During this turn, attacks used by your" in text:
-        return 58 if ctx.best_ready_damage(ctx.my_active()) > 0 else -5
+        first_turn = ctx.cur["turn"] == 1  # the player going first can't attack on turn 1
+        return 58 if not first_turn and ctx.best_ready_damage(ctx.my_active()) > 0 else -5
     if text.startswith("Heal"):
         a = ctx.my_active()
         return 55 if a and a["maxHp"] - a["hp"] >= 50 else -5
@@ -556,16 +582,12 @@ def choose(ctx: Ctx) -> list[int]:
     return order[:max(lo, min(k, hi))]
 
 
-def agent(obs_dict: dict) -> list[int]:
-    """Rule-based Pokémon TCG agent.
+def policy(obs_dict: dict) -> list[int]:
+    """Rule-based choice (also used by both players inside search rollouts).
 
     Each element in the returned list must be >= 0 and < len(obs.select.option).
     The list length must be between obs.select.minCount and obs.select.maxCount (inclusive), with no duplicate elements.
     """
-    if obs_dict.get("select") is None:
-        # Initial selection: return the 60-card deck.
-        return read_deck_csv()
-
     sel = obs_dict["select"]
     n = len(sel["option"])
     try:
@@ -574,7 +596,77 @@ def agent(obs_dict: dict) -> list[int]:
         if sel["minCount"] <= len(picked) <= sel["maxCount"]:
             return picked
     except Exception:
-        if os.environ.get("AGENT_DEBUG"):
+        if DEBUG:
             raise
     # Fallback: never crash, always return something legal.
     return random.sample(range(n), sel["maxCount"])
+
+
+# ---------------------------------------------------------------------------
+# Search
+# ---------------------------------------------------------------------------
+DEBUG = bool(os.environ.get("AGENT_DEBUG"))
+SEARCH = os.environ.get("AGENT_SEARCH", "1") != "0"
+# Seconds of search per decision when the environment doesn't report remaining time (local testing).
+LOCAL_BUDGET = float(os.environ.get("AGENT_BUDGET", "0.3"))
+TOTAL_BUDGET = 600.0       # Kaggle overage time per agent for a whole Bo3 episode
+SAFETY = 120.0             # never let remaining time drop below this
+MAX_PER_DECISION = 2.0
+MAIN_ONLY = os.environ.get("AGENT_MAIN_ONLY") == "1"
+REAL_ME = None             # my player index in the real game (rollouts also play the opponent)
+
+_searcher = None
+
+
+def _search_budget(obs_dict) -> float:
+    remaining = obs_dict.get("remainingOverageTime")
+    if remaining is None:
+        return LOCAL_BUDGET
+    # ~40 searched decisions per game, up to 3 games; spend proportionally to what's left.
+    return max(0.0, min(MAX_PER_DECISION, (remaining - SAFETY) / 80))
+
+
+class _Globals:
+    """Live view of this file's globals (Kaggle may exec this file without registering it as a module)."""
+
+    def __getattr__(self, name):
+        return globals()[name]
+
+
+def _make_searcher():
+    agent_dir = "/kaggle_simulations/agent"
+    if os.path.isdir(agent_dir) and agent_dir not in sys.path:
+        sys.path.append(agent_dir)
+    import search
+    return search.Searcher(_Globals())
+
+
+def agent(obs_dict: dict) -> list[int]:
+    global REAL_ME, _searcher
+    if obs_dict.get("select") is None:
+        # Initial selection: return the 60-card deck.
+        return read_deck_csv()
+
+    sel = obs_dict["select"]
+    cur = obs_dict["current"]
+    REAL_ME = cur["yourIndex"]
+    fallback = policy(obs_dict)
+    if not SEARCH:
+        return fallback
+    try:
+        if _searcher is None:
+            _searcher = _make_searcher()
+        _searcher.opp_model.observe(obs_dict, 1 - REAL_ME)
+        if cur["turn"] == 0 or len(sel["option"]) < 2 or not obs_dict.get("search_begin_input") \
+                or sel["option"][0]["type"] == O_SKILL or (MAIN_ONLY and sel["context"] != C_MAIN):
+            return fallback
+        budget = _search_budget(obs_dict)
+        if budget < 0.02:
+            return fallback
+        best = _searcher.choose(obs_dict, budget, fallback)
+        if best is not None:
+            return best
+    except Exception:
+        if DEBUG:
+            raise
+    return fallback
